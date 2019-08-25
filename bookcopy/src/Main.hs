@@ -8,6 +8,7 @@ import Data.List as L hiding (find)
 import Data.Text.Metrics
 import Data.Either
 import Data.Maybe
+import Control.Monad
 
 parser :: Parser (FilePath, FilePath)
 parser = (,) <$> argPath "src" "Book source directory"
@@ -35,8 +36,10 @@ extPat = foldr1 (<|>) (map matchExt exts)
 books :: FilePath -> IO [FilePath]
 books path = do
   bookPaths <- reduce (Fold (flip (:)) [] id) $ find extPat path
-  return $ nubBy eqFileName $  L.sortBy sorter bookPaths
-  where extension' = fromMaybe (error "should never happen") . extension
+  bookPaths' <- filterM isRegIO bookPaths
+  return $ nubBy eqFileName $  L.sortBy sorter bookPaths'
+  where isRegIO p = isRegularFile <$> stat p
+        extension' = fromMaybe (error "should never happen") . extension
         priority = zipWith (,) exts [1..]
         sorter p1 p2 = let e1 = extension' p1; e2 = extension' p2
                        in lookup e1 priority `compare` lookup e2 priority
