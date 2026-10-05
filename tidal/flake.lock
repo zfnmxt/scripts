@@ -23,11 +23,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791177199,
-        "narHash": "sha256-qHAiqYF/4POHbhjWxmcnOnHvhVu+vv9rnxQKEGXpSzg=",
+        "lastModified": 1791177668,
+        "narHash": "sha256-0wr4ovzhk15k4SHhe7xY6MaFamN5L9ZbcJaW8Q4M2A8=",
         "ref": "refs/heads/main",
-        "rev": "bd6faad225081a6c98483dc6a9f1209c0b09c64f",
-        "revCount": 1,
+        "rev": "cf0e868db66ad831b6c795e9aea6d1ddabba3dd1",
+        "revCount": 2,
         "type": "git",
         "url": "ssh://git@github.com/zfnmxt/packages"
       },
