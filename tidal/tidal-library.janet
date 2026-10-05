@@ -192,10 +192,14 @@ quality and cover embedding come from tiddl's own config.
   (def [_ artist album year] (string/split "§" name))
   (def src (string staging "/" name))
   (def discs (sort (os/dir src)))
-  (def tracks (seq [disc :in discs
-                    file :in (sort (os/dir (string src "/" disc)))]
-                [disc file]))
-  # file is `NN§Title.ext`
+  (def tracks @[])
+  (each disc discs
+    (each file (sort (os/dir (string src "/" disc)))
+      # Tracks are `NN§Title.ext`; anything else is a temp file tiddl left
+      # behind when a download failed partway
+      (if (string/find "§" file)
+        (array/push tracks [disc file])
+        (os/rm (string src "/" disc "/" file)))))
   (def titles-lc (lowercase (map |(get (string/split "§" ($ 1) 0 2) 1) tracks)))
   (def dest (album-dir library artist album year))
   (eachp [i [disc file]] tracks
@@ -211,10 +215,7 @@ quality and cover embedding come from tiddl's own config.
   "Download album `id` into `staging` with tiddl; true on success. Without
   --verbose, tiddl's output goes to `logfile`."
   [id staging logfile]
-  # tiddl writes each track to a temp file first; on the staging filesystem,
-  # moving it into place is an atomic rename, never a half-copied file
-  (def args ["env" (string "TMPDIR=" staging "/.tmp")
-             "tiddl" "download" "--raise-errors"
+  (def args ["tiddl" "download" "--raise-errors"
              "--path" staging "--scan-path" staging "--output" template
              "url" (string "album/" id)])
   (if verbose
@@ -238,14 +239,11 @@ quality and cover embedding come from tiddl's own config.
   (def failed-file (string state "/failed"))
   (def current-file (string state "/current"))
   (def logs (string state "/logs"))
-  (def tmp (string staging "/.tmp"))
   (mkdirs logs)
-  (mkdirs tmp)
   (lock)
   (defer (rm-rf lock-dir)
-    # Leftovers from an interrupted run: tiddl's temp files, and the album
-    # that was mid-download, which may have half-written files
-    (each f (os/dir tmp) (rm-rf (string tmp "/" f)))
+    # An album interrupted mid-download may have a half-written last track
+    # (tiddl tags files in place after downloading them): start it over
     (when (os/stat current-file)
       (def prefix (string (string/trim (slurp current-file)) "§"))
       (each name (os/dir staging)
