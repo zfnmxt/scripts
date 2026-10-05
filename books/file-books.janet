@@ -9,7 +9,7 @@
     ``
 usage: file-books [options]
 
-Copy each finished book download into the library with a tidy name, once:
+Copy each finished book download into the library with a tidy name:
 
   Author/Title/Author - Title.ext
 
@@ -28,22 +28,21 @@ Which files are taken from a download:
     gives its best format: epub, pdf, azw3, mobi, djvu
 MOBI/AZW3/DJVU are filed as-is (Kavita can't show them) and reported.
 
+Only downloads marked finished are filed. A mark is an empty file named like
+the download in DIR/.finished; qBittorrent's "run on torrent finished" hook
+creates it once all of a torrent's files are in place (mark one by hand with
+`touch DIR/.finished/NAME`). Filing a download removes its mark; one that
+fails keeps it, for the next run. Running it again is always safe: a file
+already in the library is never copied twice.
+
 options:
-  --downloads DIR   finished book downloads (default: /media/download/books)
+  --downloads DIR   book downloads (default: /media/download/books)
   --library DIR     the library (default: /media/books)
   -n, --dry-run     only show what would be filed
   -h, --help        show this help
-
-Downloads already filed are listed in $XDG_STATE_HOME/file-books/filed and
-skipped, so running it again is safe.
 ``))
 
 (def formats ["epub" "pdf" "azw3" "mobi" "djvu"])
-
-(def state
-  (string (or (os/getenv "XDG_STATE_HOME")
-              (string (os/getenv "HOME") "/.local/state"))
-          "/file-books"))
 
 (defn die [& msg]
   (eprint ;msg)
@@ -237,34 +236,42 @@ skipped, so running it again is safe.
       (die "unexpected argument: " (args i) "\n\n" usage))
     (++ i))
 
-  (def filed-file (string state "/filed"))
-  (def filed (tabseq [name :in (if (os/stat filed-file) (lines (slurp filed-file)) [])]
-               name true))
-  (unless dry-run (mkdirs state))
+  (def marks (string downloads "/.finished"))
+  (defn marked [] (if (os/stat marks) (sort (os/dir marks)) @[]))
+  (def attempted @{})
   (var failures 0)
-  (each download (sort (os/dir downloads))
-    (unless (or (filed download) (string/has-prefix? "." download))
-      (def chosen (choose (files-under (string downloads "/" download))))
+  # Until nothing new is marked: downloads that finish while this runs are
+  # filed too
+  (forever
+    (def todo (filter |(not (attempted $)) (marked)))
+    (when (empty? todo) (break))
+    (each download todo
+      (put attempted download true)
+      (def path (string downloads "/" download))
+      (def mark (string marks "/" download))
       (print download)
-      (when (empty? chosen) (print "  no book files"))
       (def ok
-        (try
-          (all (fn [[file dest]]
-                 (try
-                   (let [ext ((split-ext (basename file)) 1)]
-                     (when (index-of ext ["azw3" "mobi" "djvu"])
-                       (print "  note: " ext " only, Kavita won't show it"))
-                     (if dry-run
-                       (print "  would file " dest)
-                       (if-let [target (copy file dest)]
-                         (print "  -> " target)
-                         (print "  already in the library: " dest)))
-                     true)
-                   ([err] (eprint "  failed: " (basename file) ": " err) false)))
-               (map tuple chosen (destinations library download chosen)))
-          ([err] (eprint "  failed: " err) false)))
+        (if (not (os/stat path))
+          (do (print "  no longer in the downloads, dropping its mark") true)
+          (let [chosen (choose (files-under path))]
+            (when (empty? chosen) (print "  no book files"))
+            (try
+              (all (fn [[file dest]]
+                     (try
+                       (let [ext ((split-ext (basename file)) 1)]
+                         (when (index-of ext ["azw3" "mobi" "djvu"])
+                           (print "  note: " ext " only, Kavita won't show it"))
+                         (if dry-run
+                           (print "  would file " dest)
+                           (if-let [target (copy file dest)]
+                             (print "  -> " target)
+                             (print "  already in the library: " dest)))
+                         true)
+                       ([err] (eprint "  failed: " (basename file) ": " err) false)))
+                   (map tuple chosen (destinations library download chosen)))
+              ([err] (eprint "  failed: " err) false)))))
       (if ok
-        (unless dry-run (spit filed-file (string download "\n") :ab))
+        (unless dry-run (os/rm mark))
         (++ failures))))
   (when (pos? failures)
-    (die failures " download(s) failed; they'll be retried next run")))
+    (die failures " download(s) failed; they keep their mark for the next run")))
