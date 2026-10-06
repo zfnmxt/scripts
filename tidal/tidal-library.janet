@@ -26,14 +26,17 @@ options:
   --library DIR   where finished albums go (default: /media/music/tidal)
   --staging DIR   where tiddl downloads to first; must be on the library's
                   filesystem (default: /media/tidal-staging)
+  --per-day N     start at most N album downloads in any 24 hours, earlier
+                  runs' included; sync waits once it has started that many
+  --pause SECS    pause after each downloaded album (default: 3)
   -v, --verbose   also show tiddl's own output and the API paging
   -h, --help      show this help
 
 Re-running sync is safe: albums already done or already in the library are
 skipped, a failed album keeps its finished tracks for the next try, and an
 album interrupted mid-download starts over. Only one sync runs at a time.
-Done and failed album IDs, and a log per failure, are kept in
-$XDG_STATE_HOME/tidal-library/.
+Done and failed album IDs, when the last day's downloads started, and a log
+per failure, are kept in $XDG_STATE_HOME/tidal-library/.
 
 Needs tiddl (logged in with `tiddl auth login`), curl, jq and GNU sed. Track
 quality and cover embedding come from tiddl's own config.
@@ -52,6 +55,8 @@ quality and cover embedding come from tiddl's own config.
           "/{item.volume:02d}/{item.number:02d}§{item.title_version}"))
 
 (var verbose false)
+(var per-day nil)
+(var pause 3)
 
 (defn die [& msg]
   (eprint ;msg)
@@ -125,13 +130,23 @@ quality and cover embedding come from tiddl's own config.
 
 (defn tidal
   "Log in through tiddl's saved session; return the user ID and a function
-  that GETs a Tidal API path."
+  that GETs a Tidal API path. The session is renewed whenever it's about to
+  expire, since a sync can run for days."
   []
-  (sh nil "tiddl" "auth" "refresh")
-  (def [token user country]
-    (lines (sh nil "jq" "-r" ".token, .user_id, .country_code"
-               (string (os/getenv "HOME") "/.tiddl/auth.json"))))
+  (def auth-file (string (os/getenv "HOME") "/.tiddl/auth.json"))
+  (var token nil)
+  (var expires 0)
+  (defn renew []
+    # Only asks Tidal for a new token within 10 minutes of expiry
+    (sh nil "tiddl" "auth" "refresh" "--early-expire" "600")
+    (def [t e] (lines (sh nil "jq" "-r" ".token, .expires_at" auth-file)))
+    (set token t)
+    (set expires (scan-number e)))
+  (renew)
+  (def [user country]
+    (lines (sh nil "jq" "-r" ".user_id, .country_code" auth-file)))
   (defn get [path]
+    (when (> (os/time) (- expires 600)) (renew))
     (def sep (if (string/find "?" path) "&" "?"))
     # The token goes in through stdin so it never shows up in `ps`
     (sh (string "Authorization: Bearer " token)
@@ -234,8 +249,38 @@ quality and cover embedding come from tiddl's own config.
       (die "a sync is already running (pid " pid ")")))
   (spit (string lock-dir "/pid") (string (os/getpid))))
 
+(defn pace
+  "Wait until one more album download fits in --per-day, then add now to
+  `file`, the start times of the last day's downloads."
+  [file]
+  (defn recent []
+    (def since (- (os/time) 86400))
+    (sort (filter |(> $ since)
+                  (keep scan-number (if (os/stat file) (lines (slurp file)) [])))))
+  (var starts (recent))
+  (when per-day
+    (while (>= (length starts) per-day)
+      # Until enough of them are a day old to leave room for one more
+      (def wait (max 1 (- (+ (starts (- (length starts) per-day)) 86400)
+                          (os/time))))
+      (print "  " (length starts) " downloads started in the last 24 hours, "
+             "waiting " (duration wait))
+      (ev/sleep wait)
+      (set starts (recent))))
+  (spit file (string (string/join (map string [;starts (os/time)]) "\n") "\n")))
+
+(defn eta
+  "Roughly how long `left` more downloads take at `avg` seconds each."
+  [left avg]
+  (def per (+ avg pause))
+  (def steady (* left per))
+  (if per-day
+    (max steady (+ (* (div left per-day) 86400) (* (% left per-day) per)))
+    steady))
+
 (defn sync [staging library]
   (def done-file (string state "/done"))
+  (def downloads-file (string state "/downloads"))
   (def failed-file (string state "/failed"))
   (def current-file (string state "/current"))
   (def logs (string state "/logs"))
@@ -289,6 +334,7 @@ quality and cover embedding come from tiddl's own config.
 
         (do
           (def logfile (string logs "/" id ".log"))
+          (pace downloads-file)
           (def start (os/clock))
           (spit current-file id)
           (def ok (and (download id staging logfile)
@@ -304,14 +350,14 @@ quality and cover embedding come from tiddl's own config.
               (spit done-file (string id "\n") :ab)
               (when (os/stat logfile) (os/rm logfile))
               (report "done in " (duration took) ", ETA "
-                      (duration (* left (/ download-time downloaded)))))
+                      (duration (eta left (/ download-time downloaded)))))
             (do
               (++ failed)
               (spit failed-file (string id "\n") :ab)
               (report "FAILED" (if verbose "" (string ", see " logfile)))))
           # Pause after albums that actually downloaded something, to stay
           # under Tidal's rate limits
-          (when (> took 5) (ev/sleep 3)))))
+          (when (> took 5) (ev/sleep pause)))))
 
     (print "Finished in " (duration (- (os/clock) started)) ": "
            downloaded " downloaded, " present " already in the library, "
@@ -325,7 +371,12 @@ quality and cover embedding come from tiddl's own config.
   (var i 0)
   (defn value []
     (++ i)
-    (or (get args i) (die (args (dec i)) " needs a directory")))
+    (or (get args i) (die (args (dec i)) " needs a value")))
+  (defn number [least]
+    (def flag (args i))
+    (def n (scan-number (value)))
+    (unless (and n (>= n least)) (die flag " needs a number, at least " least))
+    n)
   (while (< i (length args))
     (def arg (args i))
     (case arg
@@ -335,6 +386,8 @@ quality and cover embedding come from tiddl's own config.
       "--verbose" (set verbose true)
       "--library" (set library (value))
       "--staging" (set staging (value))
+      "--per-day" (set per-day (number 1))
+      "--pause" (set pause (number 0))
       (if cmd
         (die "unexpected argument: " arg "\n\n" usage)
         (set cmd arg)))
