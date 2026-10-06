@@ -7,7 +7,7 @@
 (def usage
   (string/trim
     ``
-usage: tidal-library [options] list|sync
+usage: tidal-library [options] list|sync|export FILE
 
 Mirror a Tidal library into a music folder with tiddl, filing each album the
 way the rest of the library is laid out:
@@ -17,13 +17,14 @@ way the rest of the library is laid out:
 
 Albums: saved albums, plus the whole album of every saved track and of every
 track in the playlists in $TIDAL_PLAYLISTS (space-separated UUIDs), as Tidal
-lists them now or, with --from, as a JSON backup of the library does
-(favorites.albums, favorites.tracks and playlists, each item as Tidal's API
-gives it).
+lists them now or, with --from, as a backup made by export does.
 
 commands:
-  list   print the IDs of the albums to mirror
-  sync   download and file every album not yet in the library
+  list          print the IDs of the albums to mirror
+  sync          download and file every album not yet in the library
+  export FILE   back the library up to FILE, metadata only, as JSON: saved
+                albums, tracks, artists and videos, every playlist made or
+                saved with its items, each as Tidal's API gives it
 
 options:
   --library DIR   where finished albums go (default: /media/music/tidal)
@@ -182,32 +183,32 @@ quality and cover embedding come from tiddl's own config.
       (error (string "HTTP " status " for " path))))
   [user get])
 
-(defn album-ids
-  "Album IDs from every page of a paginated Tidal endpoint; `pick` is a jq
-  filter that extracts one from an item."
+(defn paged
+  "Every item of a paginated Tidal endpoint, through the jq filter `pick`:
+  one line each, compact if JSON."
   [get endpoint pick]
-  (def ids @[])
+  (def items @[])
   (var offset 0)
   (var total 1)
   (while (< offset total)
     (def page (get (string endpoint "?limit=100&offset=" offset)))
     (unless page (error (string endpoint " not found")))
     (def found
-      (lines (sh page "jq" "-r"
+      (lines (sh page "jq" "-rc"
                  (string ".totalNumberOfItems, (.items[] | " pick ")"))))
     (set total (scan-number (first found)))
-    (array/concat ids (slice found 1))
+    (array/concat items (slice found 1))
     (+= offset 100)
     (note "  " endpoint ": " (min offset total) "/" total)
     (ev/sleep 0.25))
-  ids)
+  items)
 
 (defn list-albums [[user get]]
   (distinct
-    [;(album-ids get (string "users/" user "/favorites/albums") ".item.id")
-     ;(album-ids get (string "users/" user "/favorites/tracks") ".item.album.id")
-     ;(mapcat |(album-ids get (string "playlists/" $ "/items")
-                          `select(.type == "track") | .item.album.id`)
+    [;(paged get (string "users/" user "/favorites/albums") ".item.id")
+     ;(paged get (string "users/" user "/favorites/tracks") ".item.album.id")
+     ;(mapcat |(paged get (string "playlists/" $ "/items")
+                      `select(.type == "track") | .item.album.id`)
               playlists)]))
 
 (defn backup-albums
@@ -223,6 +224,48 @@ quality and cover embedding come from tiddl's own config.
                | values
                ``
                file "--args" ;playlists))))
+
+(defn export
+  "Back the library up to `file` (see usage)."
+  [[user get] file]
+  (defn json-array [items] (string "[" (string/join items ",") "]"))
+  (def favorites
+    (seq [kind :in ["albums" "tracks" "artists" "videos"]]
+      (print "Saved " kind "...")
+      (string `"` kind `":`
+              (json-array (paged get (string "users/" user "/favorites/" kind) ".")))))
+  (print "Playlists...")
+  (def playlists
+    (lines (sh (string (json-array (paged get (string "users/" user "/playlists") "."))
+                       "\n"
+                       (json-array (paged get (string "users/" user "/favorites/playlists")
+                                          ".item")))
+               "jq" "-cs" "add | unique_by(.uuid) | .[]")))
+  (def with-items
+    (seq [i :range [0 (length playlists)]
+          :let [playlist (playlists i)
+                [uuid title] (string/split "\n" (sh playlist "jq" "-r"
+                                                    `.uuid, (.title // "" | gsub("\\s+"; " "))`))]]
+      (print "[" (inc i) "/" (length playlists) "] " title)
+      (def items
+        (try (json-array (paged get (string "playlists/" uuid "/items") "."))
+          ([err] (print "  couldn't read its items: " err) nil)))
+      (sh (string playlist "\n" (or items "null")) "jq" "-cs"
+          `.[0] + if .[1] then {items: .[1]} else {items: [], items_error: "could not be read"} end`)))
+  (print "Saved IDs...")
+  (def ids (or (get (string "users/" user "/favorites/ids"))
+               (error "favorites/ids not found")))
+  (def json
+    (string `{"exported":"` (string/trim (sh nil "date" "-Iseconds")) `",`
+            `"user":"` user `",`
+            `"favorites":{` (string/join favorites ",") `},`
+            `"playlists":` (json-array (map string/trimr with-items)) `,`
+            `"favorite_ids":` ids `}`))
+  # Checked by jq on the way, and never half-written over an older backup
+  (def tmp (string file ".tmp"))
+  (spit tmp (sh json "jq" "-c" "."))
+  (os/rename tmp file)
+  (print "Wrote " file))
 
 (defn album-info
   "Artist, title and year of album `id`, named the way tiddl will name them,
@@ -462,7 +505,7 @@ quality and cover embedding come from tiddl's own config.
   (var library default-library)
   (var staging default-staging)
   (var from nil)
-  (var cmd nil)
+  (def positional @[])
   (var i 0)
   (defn value []
     (++ i)
@@ -488,14 +531,16 @@ quality and cover embedding come from tiddl's own config.
                       (die "--quality is high or max")))
       "--per-day" (set per-day (number 1))
       "--pause" (set pause (number 0))
-      (if cmd
-        (die "unexpected argument: " arg "\n\n" usage)
-        (set cmd arg)))
+      (array/push positional arg))
     (++ i))
   (when (and from (not (os/stat from)))
     (die "no such file: " from))
+  (def [cmd file] positional)
+  (unless (= (length positional) (if (= cmd "export") 2 1))
+    (die usage))
   (case cmd
     "list" (each id (if from (backup-albums from) (list-albums (tidal)))
              (print id))
     "sync" (sync staging library from)
+    "export" (export (tidal) file)
     (die usage)))
