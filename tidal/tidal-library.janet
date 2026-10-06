@@ -32,17 +32,26 @@ options:
   --from FILE     take the albums from a library backup instead of Tidal
   --per-day N     start at most N album downloads in any 24 hours, earlier
                   runs' included; sync waits once it has started that many
-  --pause SECS    pause after each downloaded album (default: 3)
+  --pause SECS    pause after each album download, failed or not (default: 3)
   -v, --verbose   also show tiddl's own output and the API paging
   -h, --help      show this help
 
 Re-running sync is safe: albums already done or already in the library are
 skipped, a failed album keeps its finished tracks for the next try, and an
 album interrupted mid-download starts over. Only one sync runs at a time.
-After 5 failed albums in a row, sync stops: Tidal or the connection is
+After 5 albums in a row that Tidal can't be asked about (network or API
+errors; not albums it no longer has), sync stops: Tidal or the connection is
 probably down, so the rest would fail too.
-Done and failed album IDs, when the last day's downloads started, and a log
-per failure, are kept in $XDG_STATE_HOME/tidal-library/.
+
+An album tiddl downloads without errors but with fewer tracks than Tidal
+lists is incomplete: tiddl skips tracks Tidal only serves it in Dolby Atmos.
+It stays out of the library, keeps its tracks in staging, and is listed in
+the incomplete file with how many tracks it got; sync doesn't try it again
+unless its line is deleted there.
+
+Done, incomplete and failed albums, when the last day's downloads started,
+and a log per failed or incomplete album, are kept in
+$XDG_STATE_HOME/tidal-library/.
 
 Needs tiddl (logged in with `tiddl auth login`), curl, jq and GNU sed. Track
 quality and cover embedding come from tiddl's own config.
@@ -63,7 +72,7 @@ quality and cover embedding come from tiddl's own config.
 (var verbose false)
 (var per-day nil)
 (var pause 3)
-(def max-failed-in-a-row 5)
+(def max-lookups-failed 5)
 
 (defn die [& msg]
   (eprint ;msg)
@@ -152,13 +161,22 @@ quality and cover embedding come from tiddl's own config.
   (renew)
   (def [user country]
     (lines (sh nil "jq" "-r" ".user_id, .country_code" auth-file)))
-  (defn get [path]
+  (defn get
+    "The body of Tidal's answer, or nil if it has no such thing (HTTP 404).
+    Errors on any other failure."
+    [path]
     (when (> (os/time) (- expires 600)) (renew))
     (def sep (if (string/find "?" path) "&" "?"))
     # The token goes in through stdin so it never shows up in `ps`
-    (sh (string "Authorization: Bearer " token)
-        "curl" "-sf" "-m" "30" "-H" "@-"
-        (string "https://api.tidal.com/v1/" path sep "countryCode=" country)))
+    (def out (sh (string "Authorization: Bearer " token)
+                 "curl" "-s" "-m" "30" "-H" "@-" "-w" "\n%{http_code}"
+                 (string "https://api.tidal.com/v1/" path sep "countryCode=" country)))
+    (def end (last (string/find-all "\n" out)))
+    (def status (scan-number (string/slice out (inc end))))
+    (cond
+      (= status 404) nil
+      (<= 200 status 299) (string/slice out 0 end)
+      (error (string "HTTP " status " for " path))))
   [user get])
 
 (defn album-ids
@@ -170,6 +188,7 @@ quality and cover embedding come from tiddl's own config.
   (var total 1)
   (while (< offset total)
     (def page (get (string endpoint "?limit=100&offset=" offset)))
+    (unless page (error (string endpoint " not found")))
     (def found
       (lines (sh page "jq" "-r"
                  (string ".totalNumberOfItems, (.items[] | " pick ")"))))
@@ -204,26 +223,44 @@ quality and cover embedding come from tiddl's own config.
 
 (defn album-info
   "Artist, title and year of album `id`, named the way tiddl will name them,
-  or nil if Tidal doesn't have the album."
+  and its number of tracks; nil if Tidal doesn't have the album."
   [get id]
-  (def json (try (get (string "albums/" id)) ([_] nil)))
-  (when json
-    (def [artist title date]
+  (when-let [json (get (string "albums/" id))]
+    (def [artist title date tracks]
       (string/split "\n" (string/trimr (sh json "jq" "-r"
-                                           `.artist.name // "", .title // "", .releaseDate // ""`)
+                                           ``
+                                           .artist.name // "", .title // "",
+                                           .releaseDate // "", .numberOfTracks // 0
+                                           ``)
                                        "\n")))
     (def year (if (>= (length date) 4) (string/slice date 0 4) "1"))
     # tiddl cleans the whole staging folder name, so do the same before splitting
     (def [_ a t y] (string/split "§" (clean (string id "§" artist "§" title "§" year))))
-    [a t y]))
+    {:artist a :title t :year y :tracks (scan-number tracks)}))
 
 ## Downloading and filing
+
+(defn staging-folder
+  "The name of album `id`'s folder in `staging`, or nil."
+  [staging id]
+  (def prefix (string id "§"))
+  (find |(string/has-prefix? prefix $) (os/dir staging)))
+
+(defn staged-tracks
+  "How many finished tracks of album `id` are in `staging`."
+  [staging id]
+  (def name (staging-folder staging id))
+  (if name
+    (let [src (string staging "/" name)]
+      # Tracks are `NN§Title.ext` (see file-album)
+      (sum (map (fn [disc] (count |(string/find "§" $) (os/dir (string src "/" disc))))
+                (os/dir src))))
+    0))
 
 (defn file-album
   "Move album `id` from `staging` into the library layout under `library`."
   [id staging library]
-  (def prefix (string id "§"))
-  (def name (find |(string/has-prefix? prefix $) (os/dir staging)))
+  (def name (staging-folder staging id))
   (unless name (error (string "no staging folder for album " id)))
   (def [_ artist album year] (string/split "§" name))
   (def src (string staging "/" name))
@@ -306,6 +343,8 @@ quality and cover embedding come from tiddl's own config.
   (def done-file (string state "/done"))
   (def downloads-file (string state "/downloads"))
   (def failed-file (string state "/failed"))
+  # One line per album: its ID, a tab, then what it is and how many tracks
+  (def incomplete-file (string state "/incomplete"))
   (def current-file (string state "/current"))
   (def logs (string state "/logs"))
   (mkdirs logs)
@@ -327,34 +366,42 @@ quality and cover embedding come from tiddl's own config.
       (if from
         (do (print "Reading albums from " from "...") (backup-albums from))
         (do (print "Listing albums...") (list-albums session))))
-    (def done (tabseq [id :in (if (os/stat done-file) (lines (slurp done-file)) [])]
-                id true))
-    (def todo (filter |(not (done $)) all))
-    (print (length all) " albums: " (- (length all) (length todo)) " done, "
-           (length todo) " to go")
+    (defn ids [file]
+      (if (os/stat file) (map |(first (string/split "\t" $)) (lines (slurp file))) []))
+    (def done (tabseq [id :in (ids done-file)] id true))
+    (def skip (tabseq [id :in (ids incomplete-file)] id true))
+    (def todo (filter |(not (or (done $) (skip $))) all))
+    (print (length all) " albums: " (count done all) " done, "
+           (count skip all) " incomplete, " (length todo) " to go")
     (spit failed-file "")
 
     (var downloaded 0)
     (var present 0)
+    (var incomplete 0)
     (var failed 0)
-    (var failed-in-a-row 0)
+    (var lookups-failed-in-a-row 0)
     (var download-time 0)
     (def started (os/clock))
     (eachp [i id] todo
-      (def failed-before failed)
       (def left (- (length todo) i 1))
-      (def info (album-info get id))
-      (print "[" (inc i) "/" (length todo) "] "
-             (if info (let [[a t y] info] (string a " - " t " (" y ")")) (string "album/" id)))
       (defn report [& msg] (print "  " ;msg ", " left " left"))
+      (defn fail [& msg]
+        (++ failed)
+        (spit failed-file (string id "\n") :ab)
+        (report ;msg))
+      (var lookup-error nil)
+      (def info (try (album-info get id) ([err] (set lookup-error err) nil)))
+      (def name (if info (string (info :artist) " - " (info :title) " (" (info :year) ")")))
+      (print "[" (inc i) "/" (length todo) "] " (or name (string "album/" id)))
+      (if lookup-error
+        (++ lookups-failed-in-a-row)
+        (set lookups-failed-in-a-row 0))
       (cond
-        (nil? info)
-        (do
-          (++ failed)
-          (spit failed-file (string id "\n") :ab)
-          (report "not available on Tidal"))
+        lookup-error (fail "couldn't look it up: " lookup-error)
 
-        (os/stat (album-dir library ;info))
+        (nil? info) (fail "not available on Tidal")
+
+        (os/stat (album-dir library (info :artist) (info :title) (info :year)))
         (do
           (++ present)
           (spit done-file (string id "\n") :ab)
@@ -362,42 +409,49 @@ quality and cover embedding come from tiddl's own config.
 
         (do
           (def logfile (string logs "/" id ".log"))
+          (def see-log (if verbose "" (string ", see " logfile)))
           (pace downloads-file)
           (def start (os/clock))
           (spit current-file id)
-          (def ok (and (download id staging logfile)
-                       (try (do (file-album id staging library) true)
-                         ([err] (spit logfile (string "filing failed: " err "\n") :ab)
-                                false))))
-          (os/rm current-file)
-          (def took (- (os/clock) start))
-          (if ok
-            (do
-              (++ downloaded)
-              (+= download-time took)
-              (spit done-file (string id "\n") :ab)
-              (when (os/stat logfile) (os/rm logfile))
-              (report "done in " (duration took) ", ETA "
-                      (duration (eta left (/ download-time downloaded)))))
-            (do
-              (++ failed)
-              (spit failed-file (string id "\n") :ab)
-              (report "FAILED" (if verbose "" (string ", see " logfile)))))
-          # Pause after albums that actually downloaded something, to stay
-          # under Tidal's rate limits
-          (when (> took 5) (ev/sleep pause))))
+          (def ok (download id staging logfile))
+          (def got (staged-tracks staging id))
+          (cond
+            (not ok) (fail "FAILED" see-log)
 
-      (if (= failed failed-before)
-        (set failed-in-a-row 0)
-        (++ failed-in-a-row))
-      (when (>= failed-in-a-row max-failed-in-a-row)
-        (print failed-in-a-row " albums failed in a row: Tidal or the "
-               "connection is probably down. Stopping; re-run sync to go on.")
+            (< got (info :tracks))
+            (do
+              (++ incomplete)
+              (spit incomplete-file
+                    (string id "\t" name ": " got " of " (info :tracks) " tracks\n") :ab)
+              (report "only " got " of " (info :tracks) " tracks (Dolby Atmos?), "
+                      "listed in " incomplete-file see-log))
+
+            (try
+              (do
+                (file-album id staging library)
+                (def took (- (os/clock) start))
+                (++ downloaded)
+                (+= download-time took)
+                (spit done-file (string id "\n") :ab)
+                (when (os/stat logfile) (os/rm logfile))
+                (report "done in " (duration took) ", ETA "
+                        (duration (eta left (/ download-time downloaded)))))
+              ([err]
+                (spit logfile (string "filing failed: " err "\n") :ab)
+                (fail "FAILED" see-log))))
+          (os/rm current-file)
+          # Pause after every download, failed or not, to go easy on Tidal
+          (ev/sleep pause)))
+
+      (when (>= lookups-failed-in-a-row max-lookups-failed)
+        (print lookups-failed-in-a-row " albums in a row couldn't be looked up: "
+               "Tidal or the connection is probably down. Stopping; re-run "
+               "sync to go on.")
         (break)))
 
     (print "Finished in " (duration (- (os/clock) started)) ": "
            downloaded " downloaded, " present " already in the library, "
-           failed " failed"
+           incomplete " incomplete, " failed " failed"
            (if (pos? failed) (string " (IDs in " failed-file ")") ""))))
 
 (defn main [_ & args]
