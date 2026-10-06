@@ -16,7 +16,10 @@ way the rest of the library is laid out:
   Artist/artist/album[year]digital media/DD/NN-title.flac   (multi-disc)
 
 Albums: saved albums, plus the whole album of every saved track and of every
-track in the playlists in $TIDAL_PLAYLISTS (space-separated UUIDs).
+track in the playlists in $TIDAL_PLAYLISTS (space-separated UUIDs), as Tidal
+lists them now or, with --from, as a JSON backup of the library does
+(favorites.albums, favorites.tracks and playlists, each item as Tidal's API
+gives it).
 
 commands:
   list   print the IDs of the albums to mirror
@@ -26,6 +29,7 @@ options:
   --library DIR   where finished albums go (default: /media/music/tidal)
   --staging DIR   where tiddl downloads to first; must be on the library's
                   filesystem (default: /media/tidal-staging)
+  --from FILE     take the albums from a library backup instead of Tidal
   --per-day N     start at most N album downloads in any 24 hours, earlier
                   runs' included; sync waits once it has started that many
   --pause SECS    pause after each downloaded album (default: 3)
@@ -35,6 +39,8 @@ options:
 Re-running sync is safe: albums already done or already in the library are
 skipped, a failed album keeps its finished tracks for the next try, and an
 album interrupted mid-download starts over. Only one sync runs at a time.
+After 5 failed albums in a row, sync stops: Tidal or the connection is
+probably down, so the rest would fail too.
 Done and failed album IDs, when the last day's downloads started, and a log
 per failure, are kept in $XDG_STATE_HOME/tidal-library/.
 
@@ -57,6 +63,7 @@ quality and cover embedding come from tiddl's own config.
 (var verbose false)
 (var per-day nil)
 (var pause 3)
+(def max-failed-in-a-row 5)
 
 (defn die [& msg]
   (eprint ;msg)
@@ -181,6 +188,20 @@ quality and cover embedding come from tiddl's own config.
                           `select(.type == "track") | .item.album.id`)
               playlists)]))
 
+(defn backup-albums
+  "list-albums, from the library backup `file`."
+  [file]
+  (distinct
+    (lines (sh nil "jq" "-r"
+               ``
+               .favorites.albums[].item.id,
+               .favorites.tracks[].item.album.id,
+               (.playlists[] | select(.uuid | IN($ARGS.positional[]))
+                | .items[] | select(.type == "track") | .item.album.id)
+               | values
+               ``
+               file "--args" ;playlists))))
+
 (defn album-info
   "Artist, title and year of album `id`, named the way tiddl will name them,
   or nil if Tidal doesn't have the album."
@@ -278,7 +299,10 @@ quality and cover embedding come from tiddl's own config.
     (max steady (+ (* (div left per-day) 86400) (* (% left per-day) per)))
     steady))
 
-(defn sync [staging library]
+(defn sync
+  "Download every album not done yet, taking the list from the library backup
+  `from` if given."
+  [staging library from]
   (def done-file (string state "/done"))
   (def downloads-file (string state "/downloads"))
   (def failed-file (string state "/failed"))
@@ -299,8 +323,10 @@ quality and cover embedding come from tiddl's own config.
 
     (def session (tidal))
     (def [_ get] session)
-    (print "Listing albums...")
-    (def all (list-albums session))
+    (def all
+      (if from
+        (do (print "Reading albums from " from "...") (backup-albums from))
+        (do (print "Listing albums...") (list-albums session))))
     (def done (tabseq [id :in (if (os/stat done-file) (lines (slurp done-file)) [])]
                 id true))
     (def todo (filter |(not (done $)) all))
@@ -311,9 +337,11 @@ quality and cover embedding come from tiddl's own config.
     (var downloaded 0)
     (var present 0)
     (var failed 0)
+    (var failed-in-a-row 0)
     (var download-time 0)
     (def started (os/clock))
     (eachp [i id] todo
+      (def failed-before failed)
       (def left (- (length todo) i 1))
       (def info (album-info get id))
       (print "[" (inc i) "/" (length todo) "] "
@@ -357,7 +385,15 @@ quality and cover embedding come from tiddl's own config.
               (report "FAILED" (if verbose "" (string ", see " logfile)))))
           # Pause after albums that actually downloaded something, to stay
           # under Tidal's rate limits
-          (when (> took 5) (ev/sleep pause)))))
+          (when (> took 5) (ev/sleep pause))))
+
+      (if (= failed failed-before)
+        (set failed-in-a-row 0)
+        (++ failed-in-a-row))
+      (when (>= failed-in-a-row max-failed-in-a-row)
+        (print failed-in-a-row " albums failed in a row: Tidal or the "
+               "connection is probably down. Stopping; re-run sync to go on.")
+        (break)))
 
     (print "Finished in " (duration (- (os/clock) started)) ": "
            downloaded " downloaded, " present " already in the library, "
@@ -367,6 +403,7 @@ quality and cover embedding come from tiddl's own config.
 (defn main [_ & args]
   (var library default-library)
   (var staging default-staging)
+  (var from nil)
   (var cmd nil)
   (var i 0)
   (defn value []
@@ -386,13 +423,17 @@ quality and cover embedding come from tiddl's own config.
       "--verbose" (set verbose true)
       "--library" (set library (value))
       "--staging" (set staging (value))
+      "--from" (set from (value))
       "--per-day" (set per-day (number 1))
       "--pause" (set pause (number 0))
       (if cmd
         (die "unexpected argument: " arg "\n\n" usage)
         (set cmd arg)))
     (++ i))
+  (when (and from (not (os/stat from)))
+    (die "no such file: " from))
   (case cmd
-    "list" (each id (list-albums (tidal)) (print id))
-    "sync" (sync staging library)
+    "list" (each id (if from (backup-albums from) (list-albums (tidal)))
+             (print id))
+    "sync" (sync staging library from)
     (die usage)))
