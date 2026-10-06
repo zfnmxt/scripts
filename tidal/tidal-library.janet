@@ -30,6 +30,8 @@ options:
   --staging DIR   where tiddl downloads to first; must be on the library's
                   filesystem (default: /media/tidal-staging)
   --from FILE     take the albums from a library backup instead of Tidal
+  --quality Q     high (16-bit FLAC) or max (up to hi-res); default: tiddl's
+                  config
   --per-day N     start at most N album downloads in any 24 hours, earlier
                   runs' included; sync waits once it has started that many
   --pause SECS    pause after each album download, failed or not (default: 3)
@@ -72,6 +74,7 @@ quality and cover embedding come from tiddl's own config.
 (var verbose false)
 (var per-day nil)
 (var pause 3)
+(var quality nil)
 (def max-lookups-failed 5)
 
 (defn die [& msg]
@@ -289,6 +292,7 @@ quality and cover embedding come from tiddl's own config.
   --verbose, tiddl's output goes to `logfile`."
   [id staging logfile]
   (def args ["tiddl" "download" "--raise-errors"
+             ;(if quality ["--track-quality" quality] [])
              "--path" staging "--scan-path" staging "--output" template
              "url" (string "album/" id)])
   (if verbose
@@ -478,6 +482,10 @@ quality and cover embedding come from tiddl's own config.
       "--library" (set library (value))
       "--staging" (set staging (value))
       "--from" (set from (value))
+      "--quality" (do
+                    (set quality (value))
+                    (unless (index-of quality ["high" "max"])
+                      (die "--quality is high or max")))
       "--per-day" (set per-day (number 1))
       "--pause" (set pause (number 0))
       (if cmd
